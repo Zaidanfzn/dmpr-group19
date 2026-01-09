@@ -1,134 +1,12 @@
+// src/App.jsx
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Play, RotateCcw, Activity, Settings, TrendingUp, BarChart3, Info, Sun, Moon, Download, FileText, ChevronLeft, ChevronRight, Camera } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
 
 /**
- * --- MATH & UTILS ---
- */
-const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
-const step = (t, t0, amp) => (t >= t0 ? amp : 0.0);
-
-const randn = () => {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random(); 
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-};
-
-/**
- * --- SIMULATION CLASSES ---
- */
-class FOPDT {
-  constructor(K, tau, theta, y0 = 0.0, dt = 1.0) {
-    this.K = K; this.tau = tau; this.theta = theta; this.dt = dt;
-    this.delay_steps = Math.round(theta / dt);
-    this.buf = new Array(this.delay_steps + 1).fill(0.0);
-    this.y = y0;
-  }
-  reset(y0) {
-    if (y0 !== undefined) this.y = y0;
-    this.buf = new Array(this.delay_steps + 1).fill(0.0);
-  }
-  update(u, d = 0.0) {
-    this.buf.push(u);
-    const u_del = this.buf.shift();
-    const dy = (this.K * u_del + d - this.y) * (this.dt / Math.max(this.tau, 1e-9));
-    this.y += dy;
-    return this.y;
-  }
-}
-
-class PID {
-  constructor(Kp, Ti, dt = 1.0, out_min = 0.0, out_max = 100.0, bias = 0.0, aw = 0.15, reverse = false) {
-    this.Kp = Kp; this.Ti = Ti; this.dt = dt;
-    this.out_min = out_min; this.out_max = out_max; this.bias = bias; this.aw = aw; this.reverse = reverse;
-    this.i = 0.0; this.e_prev = 0.0;
-    this.u_prev = clamp(bias, out_min, out_max);
-  }
-  reset(u0) {
-    this.i = 0.0; this.e_prev = 0.0;
-    this.u_prev = clamp(u0 !== undefined ? u0 : this.bias, this.out_min, this.out_max);
-  }
-  update(sp, pv) {
-    const e = this.reverse ? (pv - sp) : (sp - pv);
-    if (this.Ti && this.Ti > 1e-9) this.i += (this.dt / this.Ti) * e;
-    const u_unsat = this.bias + this.Kp * (e + this.i);
-    const u = clamp(u_unsat, this.out_min, this.out_max);
-    if (this.Ti && this.Ti > 1e-9) this.i += this.aw * (u - u_unsat);
-    this.e_prev = e; this.u_prev = u;
-    return u;
-  }
-}
-
-class DistilPlantDummy {
-  constructor(dt = 1.0) {
-    this.dt = dt;
-    this.T_feed0 = 120.0; this.T_cond0 = 45.0; this.P_top0 = 150.0; this.rho0 = 0.7400;
-    this.G_Tfeed_steam = new FOPDT(0.60, 140, 10, this.T_feed0, dt);
-    this.G_Tcond_cw = new FOPDT(-0.25, 160, 12, this.T_cond0, dt);
-    this.G_Freflux_fv = new FOPDT(0.80, 40, 3, 50.0, dt);
-    this.G_P_vent = new FOPDT(-0.90, 90, 6, 0.0, dt);
-    this.G_rho_analyzer = new FOPDT(1.0, 240, 30, this.rho0, dt);
-    this.d_feed_temp = 0.0; this.d_vapor_load = 0.0; this.cw_degrade = 1.0;
-    this.T_feed = this.T_feed0; this.T_cond = this.T_cond0; this.F_reflux = 50.0; this.P_top = this.P_top0; this.rho = this.rho0;
-  }
-  reset() {
-    this.G_Tfeed_steam = new FOPDT(0.60, 140, 10, this.T_feed0, this.dt);
-    this.G_Tcond_cw = new FOPDT(-0.25, 160, 12, this.T_cond0, this.dt);
-    this.G_Freflux_fv = new FOPDT(0.80, 40, 3, 50.0, this.dt);
-    this.G_P_vent = new FOPDT(-0.90, 90, 6, 0.0, this.dt);
-    this.G_rho_analyzer = new FOPDT(1.0, 240, 30, this.rho0, this.dt);
-    this.T_feed = this.T_feed0; this.T_cond = this.T_cond0; this.F_reflux = 50.0; this.P_top = this.P_top0; this.rho = this.rho0;
-  }
-  update(u_steam, u_cw, u_fv, u_vent, noise = true) {
-    u_steam = clamp(u_steam, 0, 100); u_cw = clamp(u_cw, 0, 100);
-    u_fv = clamp(u_fv, 0, 100); u_vent = clamp(u_vent, 0, 100);
-    this.T_feed = this.G_Tfeed_steam.update(u_steam, this.d_feed_temp);
-    this.T_cond = this.G_Tcond_cw.update(u_cw * this.cw_degrade, 0.0);
-    this.F_reflux = this.G_Freflux_fv.update(u_fv, 0.0);
-    const vapor_coupling = 0.70 * (this.T_feed - this.T_feed0) - 0.15 * (this.F_reflux - 50.0);
-    const relief = this.G_P_vent.update(u_vent, 0.0);
-    this.P_top = this.P_top0 + this.d_vapor_load + vapor_coupling + relief + 0.20 * (this.T_cond - this.T_cond0);
-    const rho_ss = this.rho0 + 0.0008 * (this.T_feed - this.T_feed0) - 0.0012 * (this.F_reflux - 50.0);
-    this.rho = this.G_rho_analyzer.update(rho_ss, 0.0);
-    if (!noise) return { Tfeed: this.T_feed, Tcond: this.T_cond, Ptop: this.P_top, Freflux: this.F_reflux, rho: this.rho };
-    return {
-      Tfeed: this.T_feed + randn() * 0.2, Tcond: this.T_cond + randn() * 0.2,
-      Ptop: this.P_top + randn() * 0.3, Freflux: this.F_reflux + randn() * 0.4, rho: this.rho + randn() * 0.0005,
-    };
-  }
-}
-
-/**
- * --- METRICS CALCULATION ---
- */
-const calculateMetrics = (tArr, pvArr, spArr, mvArr, bandPct = 0.01, minAbs = 0.0) => {
-  let iae = 0, ise = 0, overshoot = 0, undershoot = 0, settlingTime = null;
-  const spFinal = spArr[spArr.length - 1];
-  const tol = Math.max(minAbs, bandPct * Math.abs(spFinal));
-  let settledIndex = -1;
-  for (let i = tArr.length - 1; i >= 0; i--) {
-    if (Math.abs(pvArr[i] - spFinal) > tol) { settledIndex = i + 1; break; }
-  }
-  if (settledIndex < tArr.length) settlingTime = tArr[settledIndex];
-  else settlingTime = null;
-  if (Math.abs(pvArr[0] - spFinal) <= tol && settledIndex === 0) settlingTime = 0;
-
-  for (let i = 0; i < tArr.length; i++) {
-    const dt = (i === 0) ? 0 : (tArr[i] - tArr[i - 1]);
-    const e = spArr[i] - pvArr[i];
-    if (i > 0) { iae += Math.abs(e) * dt; ise += (e * e) * dt; }
-    overshoot = Math.max(overshoot, pvArr[i] - spFinal);
-    undershoot = Math.max(undershoot, spFinal - pvArr[i]);
-  }
-  return { IAE: iae, ISE: ise, Overshoot: Math.max(0, overshoot), Undershoot: Math.max(0, undershoot), SettlingTime: settlingTime };
-};
-
-/**
  * --- COMPONENTS ---
  */
 
-// Logo 19 Elegant Component
 const Logo19 = ({ className }) => (
   <div className={`relative flex items-center justify-center ${className}`}>
     <svg viewBox="0 0 100 100" className="w-full h-full text-teal-500 fill-current">
@@ -140,7 +18,6 @@ const Logo19 = ({ className }) => (
   </div>
 );
 
-// Chart Saver Helper
 const downloadChartAsPng = (chartId, title) => {
   const svg = document.querySelector(`#${chartId} .recharts-surface`);
   if (!svg) return;
@@ -150,13 +27,11 @@ const downloadChartAsPng = (chartId, title) => {
   const ctx = canvas.getContext("2d");
   const img = new Image();
   
-  // Get SVG dimensions
   const svgSize = svg.getBoundingClientRect();
   canvas.width = svgSize.width;
   canvas.height = svgSize.height;
   
   img.onload = () => {
-    // Fill background (white for image)
     ctx.fillStyle = "#ffffff";
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0);
@@ -187,105 +62,60 @@ export default function App() {
   });
 
   const [runParams, setRunParams] = useState(null); 
-  // FIX: Inisialisasi dengan Array kosong [], bukan null agar Recharts tidak error
   const [simData, setSimData] = useState([]); 
   const [metrics, setMetrics] = useState(null);
 
+  // ===========================
+  // NEW: Web Worker setup
+  // ===========================
+  const workerRef = useRef(null);
+
+  useEffect(() => {
+    workerRef.current = new Worker(new URL('./sim.worker.js', import.meta.url), { type: 'module' });
+
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+    };
+  }, []);
+
   const runSimulation = useCallback(async () => {
     setIsSimulating(true);
-    
-    // Memberikan waktu sedikit agar UI bisa render loading state jika diperlukan
+
     await new Promise(r => setTimeout(r, 100));
 
-    setRunParams({...params});
+    setRunParams({ ...params });
 
-    const { sim_s, dt, sp_Tfeed, sp_Tcond, sp_rho, enableP, kp101, ti101, kp201, ti201, kpf, tif, kpa, tia, kpp, tip } = params;
-    
-    const plant = new DistilPlantDummy(dt);
-    plant.reset();
+    setSimData([]);
+    setMetrics(null);
 
-    const tic101 = new PID(kp101, ti101, dt, 0, 100, 35, 0.15, false);
-    const tic201 = new PID(kp201, ti201, dt, 0, 100, 45, 0.15, true);
-    const fic201 = new PID(kpf, tif, dt, 0, 100, 55, 0.10, false);
-    const aic201 = new PID(kpa, tia, dt, 10, 90, 50, 0.05, true);
-    const pic201 = new PID(kpp, tip, dt, 0, 100, 5, 0.10, true);
+    if (!workerRef.current) {
+      setIsSimulating(false);
+      return;
+    }
 
-    const log = {
-      t: [], Tfeed: [], Tcond: [], Ptop: [], Freflux: [], rho: [],
-      SP_Tfeed: [], SP_Tcond: [], SP_rho: [], SP_reflux: [], SP_Ptop: [],
-      u_steam: [], u_cw: [], u_fv: [], u_vent: []
+    workerRef.current.onmessage = (ev) => {
+      const payload = ev?.data || {};
+      const chartData = Array.isArray(payload.chartData) ? payload.chartData : [];
+      const m = Array.isArray(payload.metrics) ? payload.metrics : null;
+
+      setSimData(chartData);
+      setMetrics(m);
+      setIsSimulating(false);
     };
 
-    let u_steam = 35, u_cw = 45, u_fv = 55, u_vent = 5;
-    let sp_reflux = 50.0;
-    
-    const t_sp_step = 600, d_sp_Tfeed = 3.0;
-    const t_feed_dist = 900, d_feed_temp = 8.0;
-    const t_vapor_dist = 1500, d_vapor = 12.0;
-    const t_cw_degrade = 2100, cw_degrade_amt = 0.25;
+    workerRef.current.onerror = () => {
+      setIsSimulating(false);
+    };
 
-    for (let ti = 0; ti <= sim_s; ti += dt) {
-      plant.d_feed_temp = step(ti, t_feed_dist, d_feed_temp);
-      plant.d_vapor_load = step(ti, t_vapor_dist, d_vapor);
-      plant.cw_degrade = 1.0 - step(ti, t_cw_degrade, cw_degrade_amt);
-
-      const spTfeed = sp_Tfeed + step(ti, t_sp_step, d_sp_Tfeed);
-      const spTcond = sp_Tcond;
-      const spRho = sp_rho;
-      const spPtop = 150.0;
-
-      const m = plant.update(u_steam, u_cw, u_fv, u_vent, true);
-
-      u_steam = tic101.update(spTfeed, m.Tfeed);
-      u_cw = tic201.update(spTcond, m.Tcond);
-      sp_reflux = aic201.update(spRho, m.rho);
-      u_fv = fic201.update(sp_reflux, m.Freflux);
-      u_vent = enableP ? pic201.update(spPtop, m.Ptop) : 0.0;
-
-      log.t.push(ti);
-      log.Tfeed.push(m.Tfeed); log.Tcond.push(m.Tcond); log.Ptop.push(m.Ptop);
-      log.Freflux.push(m.Freflux); log.rho.push(m.rho);
-      log.SP_Tfeed.push(spTfeed); log.SP_Tcond.push(spTcond); 
-      log.SP_rho.push(spRho); log.SP_reflux.push(sp_reflux); log.SP_Ptop.push(spPtop);
-      log.u_steam.push(u_steam); log.u_cw.push(u_cw); log.u_fv.push(u_fv); log.u_vent.push(u_vent);
-    }
-
-    const factor = Math.max(1, Math.floor(log.t.length / 500));
-    const chartData = [];
-    for(let i=0; i<log.t.length; i+=factor) {
-      chartData.push({
-        t: Math.round(log.t[i]),
-        Tfeed: log.Tfeed[i], SP_Tfeed: log.SP_Tfeed[i],
-        Tcond: log.Tcond[i], SP_Tcond: log.SP_Tcond[i],
-        rho: log.rho[i], SP_rho: log.SP_rho[i],
-        Freflux: log.Freflux[i], SP_reflux: log.SP_reflux[i],
-        Ptop: log.Ptop[i], SP_Ptop: log.SP_Ptop[i],
-        u_steam: log.u_steam[i], u_cw: log.u_cw[i],
-        u_fv: log.u_fv[i], u_vent: log.u_vent[i]
-      });
-    }
-    setSimData(chartData);
-
-    const m1 = calculateMetrics(log.t, log.Tfeed, log.SP_Tfeed, log.u_steam, 0.01, 0.3);
-    const m2 = calculateMetrics(log.t, log.Tcond, log.SP_Tcond, log.u_cw, 0.01, 0.3);
-    const m3 = calculateMetrics(log.t, log.rho, log.SP_rho, null, 0.01, 0.001);
-    const m4 = calculateMetrics(log.t, log.Freflux, log.SP_reflux, log.u_fv, 0.02, 0.5);
-
-    setMetrics([
-      { name: "TIC-101 (Preheater)", ...m1 },
-      { name: "TIC-201 (Condenser)", ...m2 },
-      { name: "AIC-201 (Density)", ...m3 },
-      { name: "FIC-201 (Reflux)", ...m4 },
-    ]);
-
-    setIsSimulating(false);
+    workerRef.current.postMessage({ ...params });
   }, [params]);
 
   useEffect(() => { runSimulation(); }, []);
 
   const handleParamChange = (key, val) => setParams(prev => ({ ...prev, [key]: parseFloat(val) }));
-
-  // --- SUB COMPONENTS ---
 
   const SliderControl = ({ label, id, min, max, step, val, unit = "" }) => (
     <div className="mb-3">
@@ -302,7 +132,7 @@ export default function App() {
   );
 
   const ChartCard = ({ title, id, children }) => (
-    <div className={`border rounded-xl p-1 shadow-sm h-[400px] flex flex-col relative transition-colors duration-300
+    <div className={`border rounded-xl p-1 shadow-sm h-[320px] md:h-[400px] flex flex-col relative transition-colors duration-300
       ${isDarkMode ? 'bg-neutral-900 border-gray-800' : 'bg-white border-gray-200'}`} id={id}>
       <div className="px-4 py-3 flex justify-between items-center border-b border-gray-100 dark:border-gray-800">
         <div className={`text-sm font-bold uppercase tracking-wide ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
@@ -317,7 +147,6 @@ export default function App() {
         </button>
       </div>
       <div className="flex-1 p-2">
-        {/* FIX: Pastikan simData tidak null saat dipassing ke chart */}
         {children}
       </div>
     </div>
@@ -329,30 +158,32 @@ export default function App() {
     { title: "Controller Outputs (MV)", charts: ["outputs"] }
   ];
 
+  const fmt = (v, digits = 1) =>
+  Number.isFinite(Number(v)) ? Number(v).toFixed(digits) : "-";
+
   return (
     <div className={`min-h-screen font-sans transition-colors duration-300 flex flex-col
       ${isDarkMode ? 'bg-neutral-950 text-gray-200 selection:bg-teal-900 selection:text-white' : 'bg-gray-50 text-gray-800 selection:bg-teal-100 selection:text-teal-900'}`}>
       
-      {/* HEADER */}
       <header className={`border-b sticky top-0 z-50 backdrop-blur-md transition-colors duration-300
         ${isDarkMode ? 'border-gray-800 bg-neutral-900/80' : 'border-gray-200 bg-white/80'}`}>
-        <div className="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
-          <div className="flex items-center gap-4">
-            <div className={`w-12 h-12 rounded-xl flex items-center justify-center border shadow-sm
+        <div className="w-full px-4 lg:px-8 py-3 flex justify-between items-center">
+          <div className="flex items-center gap-2 md:gap-4">
+            <div className={`w-10 h-10 md:w-12 md:h-12 rounded-xl flex items-center justify-center border shadow-sm
                ${isDarkMode ? 'bg-neutral-800 border-gray-700' : 'bg-white border-gray-200'}`}>
-               <Logo19 className="w-8 h-8" />
+               <Logo19 className="w-6 h-6 md:w-8 md:h-8" />
             </div>
             <div>
-              <h1 className={`text-xl font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+              <h1 className={`text-md md:text-lg font-bold tracking-tight ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                 PT. Aimtopindo
               </h1>
-              <p className="text-xs text-teal-500 uppercase tracking-widest font-bold">
+              <p className="hidden md:block text-md text-teal-500 uppercase tracking-widest font-bold">
                 Kelompok 19 DMPR
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 md:gap-4">
             <button 
               onClick={() => setIsDarkMode(!isDarkMode)}
               className={`p-2 rounded-full border transition-all
@@ -364,21 +195,22 @@ export default function App() {
             <button 
               onClick={runSimulation}
               disabled={isSimulating}
-              className={`flex items-center gap-2 px-6 py-2.5 rounded-full font-medium transition-all shadow-lg 
+              className={`flex items-center gap-2 px-4 md:px-6 py-2 md:py-2.5 rounded-full font-medium transition-all shadow-lg 
                 ${isSimulating 
                   ? 'bg-gray-700 text-gray-400 cursor-not-allowed' 
                   : 'bg-teal-500 hover:bg-teal-400 text-white hover:scale-105 shadow-teal-500/20'}`}
             >
               {isSimulating ? <RotateCcw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4 fill-current" />}
-              {isSimulating ? 'Simulasi...' : 'Jalankan Simulasi'}
+              <span className="hidden sm:inline">
+                {isSimulating ? 'Running...' : 'Run Simulation'}
+              </span>
             </button>
           </div>
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 w-full">
+      <main className="flex-1 w-full px-4 lg:px-8 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
         
-        {/* LEFT COLUMN: CONTROLS */}
         <aside className="lg:col-span-3 space-y-4">
           <div className={`border rounded-xl p-5 shadow-sm ${isDarkMode ? 'bg-neutral-900 border-gray-800' : 'bg-white border-gray-200'}`}>
             <div className={`flex items-center gap-2 mb-4 font-semibold border-b pb-2 ${isDarkMode ? 'text-white border-gray-800' : 'text-gray-900 border-gray-100'}`}>
@@ -425,7 +257,6 @@ export default function App() {
           </div>
         </aside>
 
-        {/* RIGHT COLUMN: DATA VISUALIZATION */}
         <section className="lg:col-span-9 flex flex-col gap-6">
           
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -476,8 +307,8 @@ export default function App() {
                      {metrics.map((row, idx) => (
                        <tr key={idx}>
                          <td className="px-4 py-2 font-medium text-teal-500">{row.name.split(' ')[0]}</td>
-                         <td className="px-4 py-2">{row.IAE.toFixed(1)}</td>
-                         <td className="px-4 py-2">{row.SettlingTime !== null ? row.SettlingTime.toFixed(0) : '-'}</td>
+                         <td className="px-4 py-2">{fmt(row.IAE, 1)}</td>
+                         <td className="px-4 py-2">{fmt(row.SettlingTime, 0)}</td>
                        </tr>
                      ))}
                    </tbody>
@@ -520,12 +351,11 @@ export default function App() {
                </div>
             </div>
 
-            <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 animate-fadeIn">
+            <div className="grid grid-cols-1 gap-6 animate-fadeIn">
               {activeChartPage === 0 && (
                 <>
                   <ChartCard title="E-101: Feed Temp (°C)" id="chart-tfeed">
                     <ResponsiveContainer>
-                      {/* FIX: Gunakan array kosong sebagai default di prop data */}
                       <LineChart data={simData}>
                         <CartesianGrid strokeDasharray="3 3" stroke={isDarkMode ? "#333" : "#eee"} />
                         <XAxis dataKey="t" stroke="#888" tick={{fontSize: 10}} />
@@ -607,10 +437,9 @@ export default function App() {
         </section>
       </main>
 
-      {/* FOOTER */}
-      <footer className={`border-t py-6 mt-12 transition-colors duration-300
+      <footer className={`border-t py-6 mt-auto transition-colors duration-300
         ${isDarkMode ? 'bg-neutral-900 border-gray-800 text-gray-500' : 'bg-white border-gray-200 text-gray-400'}`}>
-        <div className="max-w-7xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center gap-4">
+        <div className="w-full px-4 lg:px-8 flex flex-col md:flex-row justify-between items-center gap-4">
           <div className="flex items-center gap-3">
              <div className="opacity-50 grayscale hover:grayscale-0 transition-all">
                 <Logo19 className="w-8 h-8" />
@@ -619,7 +448,7 @@ export default function App() {
           </div>
           <div className="flex gap-6 text-sm">
             <span>Client: PT. Aimtopindo</span>
-            <span>Project: Destilasi Semi-Continuous | PID Control</span>
+            <span>Project: Destilasi Biohidrokarbon Semi-Continuous | PID Control</span>
           </div>
         </div>
       </footer>
