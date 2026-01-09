@@ -217,23 +217,31 @@ export default function App() {
 
       <header className={`border-b sticky top-0 z-50 backdrop-blur-md transition-colors duration-300
         ${isDarkMode ? 'border-gray-800 bg-neutral-900/80' : 'border-gray-200 bg-white/80'}`}>
-        <div className="w-full px-3 sm:px-4 lg:px-8 py-2 sm:py-3 flex justify-between items-center">
-          <div className="flex items-center gap-2 md:gap-4 min-w-0">
-            <div className={`w-9 h-9 sm:w-10 sm:h-10 md:w-12 md:h-12 rounded-xl flex items-center justify-center border shadow-sm flex-shrink-0
-               ${isDarkMode ? 'bg-neutral-800 border-gray-700' : 'bg-white border-gray-200'}`}>
-              <Logo19 className="w-6 h-6 sm:w-6 sm:h-6 md:w-8 md:h-8" />
+        <div className="w-full px-2 sm:px-4 lg:px-8 py-2 sm:py-3 flex justify-between items-center gap-2">
+          
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
+            <div className={`w-8 h-8 sm:w-10 sm:h-10 md:w-12 md:h-12 rounded-xl flex items-center justify-center border shadow-sm flex-shrink-0
+              ${isDarkMode ? 'bg-neutral-800 border-gray-700' : 'bg-white border-gray-200'}`}>
+              <Logo19 className="w-5 h-5 sm:w-6 sm:h-6 md:w-8 md:h-8" />
             </div>
+
             <div className="min-w-0">
-              <h1 className={`text-base sm:text-lg md:text-lg font-bold tracking-tight truncate ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
+              <h1 className={`text-[12px] leading-4 sm:text-lg md:text-lg font-bold tracking-tight truncate
+                ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                 PT. Aimtopindo
               </h1>
-              <p className="hidden md:block text-base text-teal-500 uppercase tracking-widest font-bold">
+
+              <p className="text-[10px] leading-3 sm:hidden text-teal-500 uppercase tracking-wider font-bold truncate">
+                Kelompok 19 DMPR
+              </p>
+
+              <p className="hidden sm:block text-base text-teal-500 uppercase tracking-widest font-bold">
                 Kelompok 19 DMPR
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-2 md:gap-4 flex-shrink-0">
+          <div className="flex items-center gap-2 sm:gap-4 flex-shrink-0">
             <button
               onClick={() => setIsDarkMode(!isDarkMode)}
               className={`p-2 rounded-full border transition-all
