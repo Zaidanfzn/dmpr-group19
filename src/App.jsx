@@ -217,8 +217,8 @@ export default function App() {
 
       <header className={`border-b sticky top-0 z-50 backdrop-blur-md transition-colors duration-300
         ${isDarkMode ? 'border-gray-800 bg-neutral-900/80' : 'border-gray-200 bg-white/80'}`}>
-        <div className="w-full px-2 sm:px-4 lg:px-8 py-2 sm:py-3 flex justify-between items-center gap-2">
-          
+        <div className="w-full px-3 sm:px-4 lg:px-8 py-2 sm:py-3 flex justify-between items-center gap-2">
+
           <div className="flex items-center gap-2 sm:gap-4 min-w-0 flex-1">
             <div className={`w-8 h-8 sm:w-10 sm:h-10 md:w-12 md:h-12 rounded-xl flex items-center justify-center border shadow-sm flex-shrink-0
               ${isDarkMode ? 'bg-neutral-800 border-gray-700' : 'bg-white border-gray-200'}`}>
@@ -226,16 +226,12 @@ export default function App() {
             </div>
 
             <div className="min-w-0">
-              <h1 className={`text-[12px] leading-4 sm:text-lg md:text-lg font-bold tracking-tight truncate
+              <h1 className={`text-[11px] sm:text-base md:text-lg font-bold tracking-tight leading-tight
                 ${isDarkMode ? 'text-white' : 'text-gray-900'}`}>
                 PT. Aimtopindo
               </h1>
 
-              <p className="text-[10px] leading-3 sm:hidden text-teal-500 uppercase tracking-wider font-bold truncate">
-                Kelompok 19 DMPR
-              </p>
-
-              <p className="hidden sm:block text-base text-teal-500 uppercase tracking-widest font-bold">
+              <p className="text-[10px] sm:text-xs md:text-base text-teal-500 uppercase tracking-wider sm:tracking-widest font-bold leading-tight">
                 Kelompok 19 DMPR
               </p>
             </div>
@@ -244,17 +240,18 @@ export default function App() {
           <div className="flex items-center gap-2 sm:gap-4 flex-shrink-0">
             <button
               onClick={() => setIsDarkMode(!isDarkMode)}
-              className={`p-2 rounded-full border transition-all
+              className={`p-1.5 sm:p-2 rounded-full border transition-all
               ${isDarkMode ? 'bg-gray-800 border-gray-700 text-yellow-400' : 'bg-gray-100 border-gray-300 text-gray-600'}`}
               aria-label="Toggle theme"
             >
-              {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+              {isDarkMode ? <Sun size={16} className="sm:hidden" /> : <Moon size={16} className="sm:hidden" />}
+              {isDarkMode ? <Sun size={18} className="hidden sm:block" /> : <Moon size={18} className="hidden sm:block" />}
             </button>
 
             <button
               onClick={runSimulation}
               disabled={isSimulating}
-              className={`flex items-center gap-2 px-3 sm:px-4 md:px-6 py-2 md:py-2.5 rounded-full font-medium transition-all shadow-lg
+              className={`flex items-center gap-2 px-3 sm:px-4 md:px-6 py-1.5 sm:py-2 md:py-2.5 rounded-full font-medium transition-all shadow-lg
                 ${isSimulating
                   ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
                   : 'bg-teal-500 hover:bg-teal-400 text-white hover:scale-105 shadow-teal-500/20'}`}
@@ -265,6 +262,7 @@ export default function App() {
               </span>
             </button>
           </div>
+
         </div>
       </header>
 
