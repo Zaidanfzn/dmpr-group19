@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Play, RotateCcw, Activity, Settings, TrendingUp, BarChart3, Info, Sun, Moon, Download, FileText, ChevronLeft, ChevronRight, Camera } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip as RechartsTooltip, Legend, ResponsiveContainer } from 'recharts';
 
@@ -170,7 +170,7 @@ const downloadChartAsPng = (chartId, title) => {
   img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgData)));
 };
 
-export default function AimtopindoDashboard() {
+export default function App() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [isSimulating, setIsSimulating] = useState(false);
   const [activeChartPage, setActiveChartPage] = useState(0);
@@ -186,16 +186,17 @@ export default function AimtopindoDashboard() {
     kpp: 1.5, tip: 120
   });
 
-  // Stores the parameters used for the LAST simulation run
   const [runParams, setRunParams] = useState(null); 
-  const [simData, setSimData] = useState(null);
+  // FIX: Inisialisasi dengan Array kosong [], bukan null agar Recharts tidak error
+  const [simData, setSimData] = useState([]); 
   const [metrics, setMetrics] = useState(null);
 
   const runSimulation = useCallback(async () => {
     setIsSimulating(true);
+    
+    // Memberikan waktu sedikit agar UI bisa render loading state jika diperlukan
     await new Promise(r => setTimeout(r, 100));
 
-    // Save current params as "Run Params" for the table
     setRunParams({...params});
 
     const { sim_s, dt, sp_Tfeed, sp_Tcond, sp_rho, enableP, kp101, ti101, kp201, ti201, kpf, tif, kpa, tia, kpp, tip } = params;
@@ -218,7 +219,6 @@ export default function AimtopindoDashboard() {
     let u_steam = 35, u_cw = 45, u_fv = 55, u_vent = 5;
     let sp_reflux = 50.0;
     
-    // Disturbance timing
     const t_sp_step = 600, d_sp_Tfeed = 3.0;
     const t_feed_dist = 900, d_feed_temp = 8.0;
     const t_vapor_dist = 1500, d_vapor = 12.0;
@@ -317,12 +317,12 @@ export default function AimtopindoDashboard() {
         </button>
       </div>
       <div className="flex-1 p-2">
+        {/* FIX: Pastikan simData tidak null saat dipassing ke chart */}
         {children}
       </div>
     </div>
   );
 
-  // Pagination Logic for Charts
   const CHART_PAGES = [
     { title: "Temperatures (E-101 & C-201)", charts: ["Tfeed", "Tcond"] },
     { title: "Quality & Reflux", charts: ["rho", "Freflux"] },
@@ -338,7 +338,6 @@ export default function AimtopindoDashboard() {
         ${isDarkMode ? 'border-gray-800 bg-neutral-900/80' : 'border-gray-200 bg-white/80'}`}>
         <div className="max-w-7xl mx-auto px-4 py-3 flex justify-between items-center">
           <div className="flex items-center gap-4">
-            {/* LOGO AREA - Can be replaced by img src later */}
             <div className={`w-12 h-12 rounded-xl flex items-center justify-center border shadow-sm
                ${isDarkMode ? 'bg-neutral-800 border-gray-700' : 'bg-white border-gray-200'}`}>
                <Logo19 className="w-8 h-8" />
@@ -354,7 +353,6 @@ export default function AimtopindoDashboard() {
           </div>
 
           <div className="flex items-center gap-4">
-             {/* THEME TOGGLE */}
             <button 
               onClick={() => setIsDarkMode(!isDarkMode)}
               className={`p-2 rounded-full border transition-all
@@ -380,7 +378,7 @@ export default function AimtopindoDashboard() {
 
       <main className="flex-1 max-w-7xl mx-auto px-4 py-6 grid grid-cols-1 lg:grid-cols-12 gap-6 w-full">
         
-        {/* LEFT COLUMN: CONTROLS (Fixed width, Scrollable if needed) */}
+        {/* LEFT COLUMN: CONTROLS */}
         <aside className="lg:col-span-3 space-y-4">
           <div className={`border rounded-xl p-5 shadow-sm ${isDarkMode ? 'bg-neutral-900 border-gray-800' : 'bg-white border-gray-200'}`}>
             <div className={`flex items-center gap-2 mb-4 font-semibold border-b pb-2 ${isDarkMode ? 'text-white border-gray-800' : 'text-gray-900 border-gray-100'}`}>
@@ -430,10 +428,8 @@ export default function AimtopindoDashboard() {
         {/* RIGHT COLUMN: DATA VISUALIZATION */}
         <section className="lg:col-span-9 flex flex-col gap-6">
           
-          {/* TABLES AREA (Grid of 2 tables) */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             
-            {/* TABLE 1: PARAMETER METRICS (Settings Used) */}
             {runParams && (
             <div className={`border rounded-xl overflow-hidden shadow-sm ${isDarkMode ? 'bg-neutral-900 border-gray-800' : 'bg-white border-gray-200'}`}>
               <div className={`p-3 border-b flex items-center gap-2 ${isDarkMode ? 'border-gray-800' : 'border-gray-100'}`}>
@@ -461,7 +457,6 @@ export default function AimtopindoDashboard() {
             </div>
             )}
 
-            {/* TABLE 2: PERFORMANCE METRICS (Output) */}
             {metrics && (
              <div className={`border rounded-xl overflow-hidden shadow-sm ${isDarkMode ? 'bg-neutral-900 border-gray-800' : 'bg-white border-gray-200'}`}>
                <div className={`p-3 border-b flex items-center gap-2 ${isDarkMode ? 'border-gray-800' : 'border-gray-100'}`}>
@@ -492,9 +487,7 @@ export default function AimtopindoDashboard() {
             )}
           </div>
 
-          {/* CHARTS CONTAINER WITH PAGINATION */}
           <div className="flex-1 flex flex-col">
-            {/* Pagination Controls */}
             <div className="flex justify-between items-center mb-4">
                <h2 className={`text-lg font-bold ${isDarkMode ? 'text-white' : 'text-gray-800'}`}>
                  Grafik Simulasi: <span className="text-teal-500">{CHART_PAGES[activeChartPage].title}</span>
@@ -527,12 +520,12 @@ export default function AimtopindoDashboard() {
                </div>
             </div>
 
-            {/* Render Active Charts */}
             <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 animate-fadeIn">
               {activeChartPage === 0 && (
                 <>
                   <ChartCard title="E-101: Feed Temp (°C)" id="chart-tfeed">
                     <ResponsiveContainer>
+                      {/* FIX: Gunakan array kosong sebagai default di prop data */}
                       <LineChart data={simData}>
                         <CartesianGrid strokeDasharray="3 3" stroke={isDarkMode ? "#333" : "#eee"} />
                         <XAxis dataKey="t" stroke="#888" tick={{fontSize: 10}} />
@@ -620,14 +613,13 @@ export default function AimtopindoDashboard() {
         <div className="max-w-7xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center gap-4">
           <div className="flex items-center gap-3">
              <div className="opacity-50 grayscale hover:grayscale-0 transition-all">
-                {/* Placeholder Logo for Footer */}
                 <Logo19 className="w-8 h-8" />
              </div>
-             <p className="text-sm font-medium">© 2024 Kelompok 19 DMPR. All rights reserved.</p>
+             <p className="text-sm font-medium">© 2026 Kelompok 19 DMPR. All rights reserved.</p>
           </div>
           <div className="flex gap-6 text-sm">
             <span>Client: PT. Aimtopindo</span>
-            <span>Project: Digital Twin PID Control</span>
+            <span>Project: Destilasi Semi-Continuous | PID Control</span>
           </div>
         </div>
       </footer>
