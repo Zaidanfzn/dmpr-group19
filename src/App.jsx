@@ -19,30 +19,64 @@ const Logo19 = ({ className }) => (
 );
 
 const downloadChartAsPng = (chartId, title) => {
-  const svg = document.querySelector(`#${chartId} .recharts-surface`);
+  const root = document.getElementById(chartId);
+  if (!root) return;
+
+  const svg = root.querySelector("svg.recharts-surface");
   if (!svg) return;
 
-  const svgData = new XMLSerializer().serializeToString(svg);
+  const rect = svg.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+
+  const dpr = window.devicePixelRatio || 1;
+
+  const bg = window.getComputedStyle(root).backgroundColor || "#ffffff";
+
+  const cloned = svg.cloneNode(true);
+
+  if (!cloned.getAttribute("xmlns")) cloned.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+  if (!cloned.getAttribute("xmlns:xlink")) cloned.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+
+  cloned.setAttribute("width", String(width));
+  cloned.setAttribute("height", String(height));
+
+  const bgRect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  bgRect.setAttribute("x", "0");
+  bgRect.setAttribute("y", "0");
+  bgRect.setAttribute("width", String(width));
+  bgRect.setAttribute("height", String(height));
+  bgRect.setAttribute("fill", bg);
+  cloned.insertBefore(bgRect, cloned.firstChild);
+
+  const svgData = new XMLSerializer().serializeToString(cloned);
+  const blob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
   const img = new Image();
-
-  const svgSize = svg.getBoundingClientRect();
-  canvas.width = svgSize.width;
-  canvas.height = svgSize.height;
-
   img.onload = () => {
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0);
+    ctx.drawImage(img, 0, 0, width, height);
+
+    URL.revokeObjectURL(url);
+
     const pngFile = canvas.toDataURL("image/png");
     const downloadLink = document.createElement("a");
-    downloadLink.download = `${title.replace(/\s+/g, '_')}.png`;
+    downloadLink.download = `${title.replace(/\s+/g, "_")}.png`;
     downloadLink.href = pngFile;
     downloadLink.click();
   };
 
-  img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgData)));
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+  };
+
+  img.src = url;
 };
 
 const getSeriesValues = (data, keys) => {

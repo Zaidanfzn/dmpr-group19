@@ -1,4 +1,4 @@
-// src/sim.worker.js (P&ID v2: multi PI + quality gate + interlocks + MODE UJI)
+// src/sim.worker.js (P&ID v2.1: deviation-FOPDT + multi PI + quality gate + interlocks + MODE UJI)
 
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, Number(x)));
 const step = (t, t0, amp) => (t >= t0 ? Number(amp) : 0.0);
@@ -32,37 +32,45 @@ const randn = () => {
 };
 
 // ============================================================
-// 2) PROCESS MODEL (FOPDT)
+// 2) PROCESS MODEL (Deviation FOPDT)
+// y_ss = y0 + K*(u_del - u0) + d
 // ============================================================
-class FOPDT {
-  constructor(K, tau, theta, y0 = 0.0, dt = 1.0) {
+class FOPDTDev {
+  constructor(K, tau, theta, y0 = 0.0, u0 = 0.0, dt = 1.0) {
     this.K = Number(K);
-    this.tau = Number(tau);
-    this.theta = Number(theta);
-    this.dt = Number(dt);
+    this.tau = Math.max(Number(tau), 1e-9);
+    this.theta = Math.max(Number(theta), 0.0);
+    this.dt = Math.max(Number(dt), 1e-9);
 
-    const safeDt = Math.max(this.dt, 1e-9);
-    this.delay_steps = Math.round(this.theta / safeDt);
-    this.buf = new Array(this.delay_steps + 1).fill(0.0);
+    this.y0 = Number(y0);
+    this.u0 = Number(u0);
+
+    this.delay_steps = Math.round(this.theta / this.dt);
+    this.buf = new Array(this.delay_steps + 1).fill(this.u0);
     this.y = Number(y0);
   }
 
-  reset(y0) {
-    if (y0 !== undefined) this.y = Number(y0);
-    this.buf = new Array(this.delay_steps + 1).fill(0.0);
+  reset(y0, u0) {
+    if (y0 !== undefined) this.y0 = Number(y0);
+    if (u0 !== undefined) this.u0 = Number(u0);
+    this.y = this.y0;
+    this.buf = new Array(this.delay_steps + 1).fill(this.u0);
   }
 
   update(u, d = 0.0) {
     this.buf.push(Number(u));
     const u_del = this.buf.shift();
-    const dy = (this.K * u_del + Number(d) - this.y) * (this.dt / Math.max(this.tau, 1e-9));
+
+    const y_ss = this.y0 + this.K * (Number(u_del) - this.u0) + Number(d);
+    const dy = (y_ss - this.y) * (this.dt / this.tau);
+
     this.y += dy;
     return this.y;
   }
 }
 
 // ============================================================
-// 3) PI CONTROLLER (ANTI-WINDUP)
+// 3) PI CONTROLLER (ANTI-WINDUP via back-calculation)
 // ============================================================
 class PI {
   constructor({ Kp, Ti, dt = 1.0, out_min = 0.0, out_max = 100.0, bias = 0.0, aw = 0.15 }) {
@@ -91,7 +99,7 @@ class PI {
     const u_unsat = this.bias + this.Kp * (e + this.I);
     const u = clamp(u_unsat, this.out_min, this.out_max);
 
-    // back-calculation
+    // back-calculation: tarik integral balik saat saturasi
     this.I += this.aw * (u - u_unsat);
 
     this.u_prev = u;
@@ -202,56 +210,108 @@ const makeInterlocks = (cfg) => {
 };
 
 // ============================================================
-// 6) DISTILLATION PLANT DUMMY (MATCHING P&ID PHILOSOPHY)
+// 6) DISTILLATION PLANT DUMMY (P&ID PHILOSOPHY) — FIXED BASELINE
+// - Temperatures now deviation-based (reachable SP)
+// - V201 level balance corrected (no forced LL at baseline)
 // ============================================================
 class DistilPlant {
   constructor(dt = 1.0) {
     this.dt = Number(dt);
 
-    // nominal
+    // ===== Nominal (around which deviation model works) =====
     this.F_feed0 = 50.0;
-    this.T_feed0 = 120.0;
-    this.T_reb0  = 165.0;
-    this.TT106_0 = 95.0;
-    this.T_cond0 = 35.0;
-    this.rho0    = 0.7400;
-    this.L0      = 50.0;
 
-    // blocks
-    this.G_Ffeed = new FOPDT(1.0,   25,  2,  this.F_feed0, this.dt);
-    this.G_Tfeed = new FOPDT(0.60, 140, 10,  this.T_feed0, this.dt);
-    this.G_Treb  = new FOPDT(0.85, 180, 12,  this.T_reb0,  this.dt);
-    this.G_TT106 = new FOPDT(1.0,  120,  8,  this.TT106_0, this.dt);
-    this.G_Tcond = new FOPDT(-0.25,160, 12,  this.T_cond0, this.dt);
-    this.G_Fref  = new FOPDT(0.80,  40,  3,  50.0,        this.dt);
-    this.G_rho   = new FOPDT(1.0,  240, 30,  this.rho0,    this.dt);
+    this.T_feed0 = 120.0;   // TIC-101 nominal
+    this.T_reb0  = 165.0;   // TIC-102 nominal
+    this.T_cond0 = 35.0;    // TIC-201 nominal
+
+    this.TT106_0 = 95.0;    // top temp proxy nominal
+    this.rho0    = 0.7400;  // rho15 nominal
+    this.L0      = 50.0;    // V201 level nominal
+
+    // ===== MV nominal/bias (matches BASE_CONFIG biases) =====
+    this.u_feed0      = 50.0;
+    this.u_steam_pre0 = 35.0;
+    this.u_steam_reb0 = 40.0;
+    this.u_cw0        = 45.0;
+    this.u_reflux0    = 55.0; // important: bias 55 should give F_reflux ~ 50
+    this.u_draw0      = 25.0;
+
+    // ===== Blocks (Deviation FOPDT) =====
+    this.G_Ffeed = new FOPDTDev(1.0,   25,  2,  this.F_feed0, this.u_feed0,      this.dt);
+
+    // Reachable: u=0..100 -> ~99..159 C
+    this.G_Tfeed = new FOPDTDev(0.60, 140, 10,  this.T_feed0, this.u_steam_pre0, this.dt);
+
+    // Reachable: u=0..100 -> ~131..216 C
+    this.G_Treb  = new FOPDTDev(0.85, 180, 12,  this.T_reb0,  this.u_steam_reb0, this.dt);
+
+    // Reflux flow: bias 55 -> PV ~ 50
+    this.G_Fref  = new FOPDTDev(0.80,  40,  3,  50.0,        this.u_reflux0,    this.dt);
+
+    // Condenser: more u_cw -> lower T_cond_out
+    this.G_Tcond = new FOPDTDev(-0.25, 160, 12, this.T_cond0, this.u_cw0,        this.dt);
+
+    // TT106 + rho are "filtered proxies": treat their setpoint as the input signal
+    this.G_TT106 = new FOPDTDev(1.0,  120,  8, this.TT106_0, this.TT106_0,       this.dt);
+    this.G_rho   = new FOPDTDev(1.0,  240, 30, this.rho0,    this.rho0,          this.dt);
+
+    // ===== V201 inventory =====
+    this.L = this.L0;
+
+    // ===== Disturbances / constraints =====
+    this.d_feed_temp   = 0.0;  // additive to T_feed_out
+    this.d_vapor_load  = 0.0;  // additive to T_reb
+    this.cw_degrade    = 1.0;  // multiply u_cw (reduce effective cooling)
+    this.analyzer_ok   = true;
+
+    // ===== Condensate inflow nominal (fix level balance) =====
+    // baseline: F_cond_in0 ≈ F_reflux0(50) + F_draw0(0.8*25=20) = 70
+    this.F_cond0 = 70.0;
+  }
+
+  reset() {
+    // reset dynamics & states
+    this.G_Ffeed.reset(this.F_feed0, this.u_feed0);
+    this.G_Tfeed.reset(this.T_feed0, this.u_steam_pre0);
+    this.G_Treb.reset(this.T_reb0, this.u_steam_reb0);
+    this.G_Fref.reset(50.0, this.u_reflux0);
+    this.G_Tcond.reset(this.T_cond0, this.u_cw0);
+    this.G_TT106.reset(this.TT106_0, this.TT106_0);
+    this.G_rho.reset(this.rho0, this.rho0);
 
     this.L = this.L0;
 
-    // disturbances / constraints
     this.d_feed_temp = 0.0;
     this.d_vapor_load = 0.0;
     this.cw_degrade = 1.0;
     this.analyzer_ok = true;
   }
 
-  reset() {
-    Object.assign(this, new DistilPlant(this.dt));
-  }
-
   update(mv, noise = true) {
-    const u_feed      = clamp(mv.u_feed ?? 50.0, 0, 100);
-    const u_steam_pre = clamp(mv.u_steam_pre ?? 35.0, 0, 100);
-    const u_steam_reb = clamp(mv.u_steam_reb ?? 40.0, 0, 100);
-    const u_cw        = clamp(mv.u_cw ?? 45.0, 0, 100);
-    const u_reflux    = clamp(mv.u_reflux ?? 55.0, 0, 100);
-    const u_draw      = clamp(mv.u_draw ?? 25.0, 0, 100);
+    const u_feed      = clamp(mv.u_feed ?? this.u_feed0, 0, 100);
+    const u_steam_pre = clamp(mv.u_steam_pre ?? this.u_steam_pre0, 0, 100);
+    const u_steam_reb = clamp(mv.u_steam_reb ?? this.u_steam_reb0, 0, 100);
+    const u_cw        = clamp(mv.u_cw ?? this.u_cw0, 0, 100);
+    const u_reflux    = clamp(mv.u_reflux ?? this.u_reflux0, 0, 100);
+    const u_draw      = clamp(mv.u_draw ?? this.u_draw0, 0, 100);
 
-    const F_feed = this.G_Ffeed.update(u_feed, 0.0);
+    // ===== Primary measured loops =====
+    const F_feed     = this.G_Ffeed.update(u_feed, 0.0);
     const T_feed_out = this.G_Tfeed.update(u_steam_pre, this.d_feed_temp);
-    const T_reb = this.G_Treb.update(u_steam_reb, this.d_vapor_load);
-    const F_reflux = this.G_Fref.update(u_reflux, 0.0);
+    const T_reb      = this.G_Treb.update(u_steam_reb, this.d_vapor_load);
 
+    const F_reflux   = this.G_Fref.update(u_reflux, 0.0);
+
+    // Cooling water degradation: reduce effective u (baseline stays OK when degrade=1)
+    const u_cw_eff = u_cw * this.cw_degrade;
+    const T_cond_out = this.G_Tcond.update(u_cw_eff, 0.0);
+
+    // ===== Internal proxies (top temperature / TT201) =====
+    // TT106 steady signal before filtering:
+    // - naik saat T_reb naik
+    // - turun saat reflux naik (lebih banyak reflux -> top lebih dingin)
+    // - sedikit naik saat feed naik
     const TT106_ss =
       this.TT106_0 +
       0.35 * (T_reb - this.T_reb0) -
@@ -260,17 +320,29 @@ class DistilPlant {
 
     const TT106 = this.G_TT106.update(TT106_ss, 0.0);
 
-    const T_cond_out = this.G_Tcond.update(u_cw * this.cw_degrade, 0.0);
+    // TT201 proxy: sedikit lebih tinggi dari TT106, tergantung kondisi reboiler
+    const TT201 = TT106 + 0.20 * (T_reb - this.T_reb0);
 
-    const TT201 = TT106 + 0.2 * (T_reb - this.T_reb0);
+    // ===== Reflux drum level (V201) — FIXED balance =====
+    // inflow condense: base 70 with mild dependency on vapor/feed
+    const F_cond_in =
+      Math.max(
+        0.0,
+        this.F_cond0 +
+          0.20 * (T_reb - this.T_reb0) +
+          0.10 * (F_feed - this.F_feed0)
+      );
 
-    // reflux drum level
-    const F_cond_in = Math.max(0.0, 40.0 + 0.25 * (T_reb - this.T_reb0));
+    // draw valve characteristic
     const F_draw = 0.8 * u_draw;
+
+    // inventory update (scaled)
     const dL = (F_cond_in - F_reflux - F_draw) * (this.dt / 200.0);
     this.L = clamp(this.L + dL, 0.0, 100.0);
 
-    // density
+    // ===== Density (rho15) =====
+    // - naik saat top temp naik (lebih berat)
+    // - turun saat reflux naik (lebih ringan / lebih banyak pemisahan)
     const rho_ss =
       this.rho0 +
       0.0009 * (TT106 - this.TT106_0) -
@@ -421,11 +493,10 @@ const simulate = (cfg) => {
   };
 
   let route_prev = "RECYCLE";
-
   const steps = Array.isArray(cfg.TEST.sp_steps) ? cfg.TEST.sp_steps : [];
 
   for (let ti = 0; ti <= sim_s; ti += dt) {
-    // disturbances
+    // disturbances (MODE UJI / test)
     plant.d_feed_temp  = step(ti, cfg.TEST.t_feed_dist, cfg.TEST.d_feed_temp);
     plant.d_vapor_load = step(ti, cfg.TEST.t_vapor_dist, cfg.TEST.d_vapor);
     plant.cw_degrade   = 1.0 - step(ti, cfg.TEST.t_cw_degrade, cfg.TEST.cw_degrade_drop);
@@ -458,7 +529,7 @@ const simulate = (cfg) => {
     sp.F_reflux   = ramp(sp.F_reflux,   sp_target.F_reflux,   cfg.RAMP.rate_F_reflux,   dt);
     sp.L_v201     = ramp(sp.L_v201,     sp_target.L_v201,     cfg.RAMP.rate_L_v201,     dt);
 
-    // measurement
+    // measurement (uses previous mv -> then we compute mv for next step)
     const pv = plant.update(mv, cfg.SIM.noise);
     const dTsub = pv.TT201 - pv.T_cond_out;
 
@@ -578,6 +649,12 @@ const run_test_suite = (base_cfg) => {
     const cfgA = deepCopyCfg(base_cfg);
     cfgA.TEST.sp_steps = [];
     cfgA.TEST.analyzer_fail_enable = false;
+
+    // baseline suite: disturbances OFF
+    cfgA.TEST.d_feed_temp = 0.0;
+    cfgA.TEST.d_vapor = 0.0;
+    cfgA.TEST.cw_degrade_drop = 0.0;
+
     tests.push(["A0_BASELINE", cfgA]);
   }
 
@@ -596,6 +673,12 @@ const run_test_suite = (base_cfg) => {
     const cfgB = deepCopyCfg(base_cfg);
     cfgB.TEST.sp_steps = [stp];
     cfgB.TEST.analyzer_fail_enable = false;
+
+    // keep disturbances OFF for step tests
+    cfgB.TEST.d_feed_temp = 0.0;
+    cfgB.TEST.d_vapor = 0.0;
+    cfgB.TEST.cw_degrade_drop = 0.0;
+
     tests.push([name, cfgB]);
   }
 
@@ -606,6 +689,7 @@ const run_test_suite = (base_cfg) => {
     cfgC1.TEST.analyzer_fail_enable = false;
     cfgC1.TEST.d_feed_temp = 8.0;
     cfgC1.TEST.cw_degrade_drop = 0.0;
+    cfgC1.TEST.d_vapor = 0.0;
     tests.push(["C1_DIST_FEED_TEMP", cfgC1]);
   }
   {
@@ -613,6 +697,7 @@ const run_test_suite = (base_cfg) => {
     cfgC2.TEST.sp_steps = [];
     cfgC2.TEST.analyzer_fail_enable = false;
     cfgC2.TEST.d_feed_temp = 0.0;
+    cfgC2.TEST.d_vapor = 0.0;
     cfgC2.TEST.cw_degrade_drop = 0.25;
     tests.push(["C2_DIST_CW_DEGRADE", cfgC2]);
   }
@@ -621,6 +706,9 @@ const run_test_suite = (base_cfg) => {
     cfgC3.TEST.sp_steps = [];
     cfgC3.TEST.analyzer_fail_enable = true;
     cfgC3.TEST.t_analyzer_fail = 1800;
+    cfgC3.TEST.d_feed_temp = 0.0;
+    cfgC3.TEST.d_vapor = 0.0;
+    cfgC3.TEST.cw_degrade_drop = 0.0;
     tests.push(["C3_ANALYZER_FAIL", cfgC3]);
   }
 
@@ -717,15 +805,17 @@ const BASE_CONFIG = {
     u_draw_force_low: 0.0,
   },
 
+  // Default single-run = baseline (disturbances OFF).
+  // MODE UJI akan override sesuai skenario.
   TEST: {
     sp_steps: [],
     t_feed_dist: 900,
-    d_feed_temp: 8.0,
+    d_feed_temp: 0.0,
     t_vapor_dist: 1500,
-    d_vapor: 12.0,
+    d_vapor: 0.0,
     t_cw_degrade: 2100,
-    cw_degrade_drop: 0.25,
-    analyzer_fail_enable: true,
+    cw_degrade_drop: 0.0,
+    analyzer_fail_enable: false,
     t_analyzer_fail: 2600,
   },
 
@@ -793,14 +883,14 @@ const build_cfg_from_params = (p) => {
   cfg.GATE.delay_on_s = Number(p.g_delay_on ?? cfg.GATE.delay_on_s);
   cfg.GATE.delay_off_s = Number(p.g_delay_off ?? cfg.GATE.delay_off_s);
 
-  // auto hysteresis widening (same philosophy as Colab UI)
+  // auto hysteresis widening
   cfg.GATE.TT106_off_low  = cfg.GATE.TT106_on_low - 2.0;
   cfg.GATE.TT106_off_high = cfg.GATE.TT106_on_high + 2.0;
   cfg.GATE.rho15_off_low  = cfg.GATE.rho15_on_low - 0.005;
   cfg.GATE.rho15_off_high = cfg.GATE.rho15_on_high + 0.005;
   cfg.GATE.dTsub_min_off  = Math.max(0.0, cfg.GATE.dTsub_min - 1.0);
 
-  // Test toggles
+  // Single-run toggle: analyzer fail only (disturbances OFF by default)
   cfg.TEST.analyzer_fail_enable = !!(p.analyzerFail ?? cfg.TEST.analyzer_fail_enable);
 
   return cfg;
@@ -822,8 +912,12 @@ self.onmessage = (e) => {
       return;
     }
 
-    // single
-    cfg.TEST.sp_steps = []; // default single scenario
+    // single = baseline run
+    cfg.TEST.sp_steps = [];
+    // baseline: disturbances OFF
+    cfg.TEST.d_feed_temp = 0.0;
+    cfg.TEST.d_vapor = 0.0;
+    cfg.TEST.cw_degrade_drop = 0.0;
 
     const { log, event_log } = simulate(cfg);
     const metrics = summarize_metrics(log, cfg);
@@ -845,6 +939,7 @@ self.onmessage = (e) => {
         Treb:  log.T_reb[i],      SP_Treb:  log.SP_T_reb[i],
         Tcond: log.T_cond_out[i], SP_Tcond: log.SP_T_cond_out[i],
         TT106: log.TT106[i],
+        TT201: log.TT201[i],
 
         // quality
         rho15: log.rho15[i],
@@ -858,10 +953,12 @@ self.onmessage = (e) => {
         analyzer_ok: log.analyzer_ok[i],
 
         // flows & level
-        Ffeed: log.F_feed[i],     SP_Ffeed: log.SP_F_feed_out ? undefined : undefined, // (guard)
+        Ffeed: log.F_feed[i],
         SP_Ffeed: log.SP_F_feed[i],
-        Freflux: log.F_reflux[i], SP_Freflux: log.SP_F_reflux[i],
-        Lv201: log.L_v201[i],     SP_Lv201: log.SP_L_v201[i],
+        Freflux: log.F_reflux[i],
+        SP_Freflux: log.SP_F_reflux[i],
+        Lv201: log.L_v201[i],
+        SP_Lv201: log.SP_L_v201[i],
 
         // MVs
         u_feed: log.u_feed[i],
