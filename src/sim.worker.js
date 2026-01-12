@@ -1,7 +1,11 @@
-// src/sim.worker.js (P&ID v2.1.1: deviation-FOPDT + multi PI + quality gate + interlocks + MODE UJI)
-// - FIX: IL-03 must be reachable with current condenser model (T_cond_out max ~46.25 C) => set HH=46.0
+// src/sim.worker.js (P&ID v2.1.1+: deviation-FOPDT + multi PI + quality gate + interlocks + MODE UJI)
+// - FIX: IL-03 reachable with current condenser model (T_cond_out max ~46.25 C) => set HH=46.0
 // - FIX: clamp tuning inputs (Kp>=0, Ti>0) to avoid "bug palsu" dari salah input UI
 // - FIX: ignore unknown sp_steps keys (avoid NaN propagation)
+// - IMPROVE: route telemetry (send routeStr + route01_product)
+// - IMPROVE: gate_stats now returns timing (tFirstProduct, tLastProduct, productTime_s)
+// - IMPROVE: settling_time handles "startup transient" even if SP is constant
+// - IMPROVE: overshoot uses step-direction (better for up/down steps)
 
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, Number(x)));
 const clamp01 = (x) => clamp(x, 0.0, 1.0);
@@ -153,6 +157,7 @@ class PI {
     const u_unsat = this.bias + this.Kp * (e + this.I);
     const u = clamp(u_unsat, this.out_min, this.out_max);
 
+    // anti-windup back calculation
     this.I += this.aw * (u - u_unsat);
 
     this.u_prev = u;
@@ -180,6 +185,7 @@ class QualityGate {
   update(dt, TT106, rho15, dTsub, analyzer_ok = true, permissive_ok = true) {
     const c = this.c;
 
+    // fail-safe
     if (!analyzer_ok || !permissive_ok) {
       this.route = "RECYCLE";
       this.on_timer = 0.0;
@@ -417,34 +423,59 @@ const calc_iae_itae = (t, sp, pv, normalize = false, span = 1.0) => {
   return { iae, itae };
 };
 
+// Overshoot berbasis arah step (lebih defensible untuk uji up/down step)
+// - step>0: overshoot = (maxPV - spFinal)/|step|
+// - step<0: overshoot = (spFinal - minPV)/|step|
 const overshoot_percent = (sp, pv) => {
+  if (!sp?.length || !pv?.length) return null;
+  const sp0 = Number(sp[0]);
   const spFinal = Number(sp[sp.length - 1]);
-  if (!Number.isFinite(spFinal) || Math.abs(spFinal) < 1e-9) return null;
-  let peak = -Infinity;
-  for (let i = 0; i < pv.length; i++) peak = Math.max(peak, Number(pv[i]));
-  return Math.max(0.0, ((peak - spFinal) / Math.abs(spFinal)) * 100.0);
+  const step = spFinal - sp0;
+  const stepAbs = Math.abs(step);
+  if (!Number.isFinite(stepAbs) || stepAbs < 1e-9) return null;
+
+  let maxPV = -Infinity;
+  let minPV = +Infinity;
+  for (let i = 0; i < pv.length; i++) {
+    const v = Number(pv[i]);
+    maxPV = Math.max(maxPV, v);
+    minPV = Math.min(minPV, v);
+  }
+
+  if (step > 0) {
+    return Math.max(0.0, ((maxPV - spFinal) / stepAbs) * 100.0);
+  } else {
+    return Math.max(0.0, ((spFinal - minPV) / stepAbs) * 100.0);
+  }
 };
 
-// ====== REPLACE THIS FUNCTION ONLY ======
+// Settling time improved:
+// - Jika SP step nyata -> hitung settle terhadap spFinal (seperti biasa)
+// - Jika SP konstan tapi PV awal beda jauh -> treat as "startup transient" dan tetap hitung settle
 const settling_time = (t, sp, pv, band = 0.02, hold_s = 60.0) => {
   if (!t?.length || !sp?.length || !pv?.length) return null;
 
   const sp0 = Number(sp[0]);
   const spFinal = Number(sp[sp.length - 1]);
 
-  // 1) Kalau baseline / tidak ada perubahan SP yang bermakna -> N/A (bukan 0)
-  const spStepAbs = Math.abs(spFinal - sp0);
-  const spStepEps = Math.max(1e-6, 0.001 * Math.max(1.0, Math.abs(sp0))); // 0.1% dari SP awal (min 1e-6)
-  if (!Number.isFinite(spStepAbs) || spStepAbs <= spStepEps) return null;
-
-  // 2) Toleransi settling terhadap nilai final
-  const tol = Math.max(Math.abs(spFinal) * Number(band), 1e-6);
-
   const dt = t.length > 1 ? (Number(t[1]) - Number(t[0])) : 1.0;
   const hold_n = Math.max(1, Math.round(Number(hold_s) / Math.max(dt, 1e-9)));
 
-  // 3) Wajib: PV harus pernah keluar band final dulu.
-  //    Kalau tidak pernah keluar band -> N/A (bukan 0)
+  // toleransi settling terhadap nilai final
+  const tol = Math.max(Math.abs(spFinal) * Number(band), 1e-6);
+
+  const spStepAbs = Math.abs(spFinal - sp0);
+  const spStepEps = Math.max(1e-6, 0.001 * Math.max(1.0, Math.abs(sp0)));
+
+  const pv0 = Number(pv[0]);
+
+  const hasMeaningfulStep = Number.isFinite(spStepAbs) && spStepAbs > spStepEps;
+
+  // Kalau tidak ada step, tapi PV awal sudah di dalam band -> N/A
+  if (!hasMeaningfulStep && Math.abs(pv0 - spFinal) <= tol) return null;
+
+  // Wajib: PV harus pernah "di luar band" final dulu.
+  // - Untuk startup transient: ini otomatis true (PV0 di luar band)
   let firstOutside = -1;
   for (let i = 0; i < pv.length; i++) {
     const v = Number(pv[i]);
@@ -452,7 +483,7 @@ const settling_time = (t, sp, pv, band = 0.02, hold_s = 60.0) => {
   }
   if (firstOutside < 0) return null;
 
-  // 4) Cari waktu pertama ketika PV masuk band dan bertahan hold_s detik
+  // Cari waktu pertama ketika PV masuk band dan bertahan hold_s detik
   for (let i = firstOutside; i < t.length; i++) {
     const j = i + hold_n;
     if (j > t.length) break;
@@ -465,16 +496,42 @@ const settling_time = (t, sp, pv, band = 0.02, hold_s = 60.0) => {
     if (ok) return Number(t[i]);
   }
 
-  // Tidak pernah settle sampai akhir simulasi
   return null;
 };
 
-const gate_stats = (routeArr) => {
+// Gate stats with timing
+const gate_stats = (t, routeArr) => {
   const r = routeArr.map((x) => (x === "PRODUCT" ? 1 : 0));
-  const frac = r.reduce((a, b) => a + b, 0) / Math.max(1, r.length);
+  const n = Math.max(1, r.length);
+
+  const dt = (t?.length > 1) ? (Number(t[1]) - Number(t[0])) : 1.0;
+
+  const sum = r.reduce((a, b) => a + b, 0);
+  const frac = sum / n;
+
   let switches = 0;
   for (let i = 1; i < r.length; i++) if (r[i] !== r[i - 1]) switches++;
-  return { productPct: frac * 100.0, switches };
+
+  let firstIdx = -1, lastIdx = -1;
+  for (let i = 0; i < r.length; i++) {
+    if (r[i] === 1) { firstIdx = i; break; }
+  }
+  for (let i = r.length - 1; i >= 0; i--) {
+    if (r[i] === 1) { lastIdx = i; break; }
+  }
+
+  const tFirstProduct = (firstIdx >= 0 && t?.length) ? Number(t[firstIdx]) : null;
+  const tLastProduct  = (lastIdx  >= 0 && t?.length) ? Number(t[lastIdx])  : null;
+
+  const productTime_s = sum * dt;
+
+  return {
+    productPct: frac * 100.0,
+    switches,
+    tFirstProduct,
+    tLastProduct,
+    productTime_s
+  };
 };
 
 // ============================================================
@@ -728,7 +785,7 @@ const run_test_suite = (base_cfg) => {
 
   const makeCfg = () => {
     const c = deepCopyCfg(base_cfg);
-    c.SIM.noise = false;
+    c.SIM.noise = false; // deterministik untuk komparasi adil
     return c;
   };
 
@@ -802,7 +859,7 @@ const run_test_suite = (base_cfg) => {
   for (const [name, cfg] of tests) {
     const { log } = simulate(cfg);
     const metrics = summarize_metrics(log, cfg);
-    const g = gate_stats(log.route);
+    const g = gate_stats(log.t, log.route);
 
     const totalIAE = metrics.reduce((acc, r) => acc + (Number(r.IAE) || 0), 0);
 
@@ -1020,14 +1077,15 @@ self.onmessage = (e) => {
 
     const { log, event_log } = simulate(cfg);
     const metrics = summarize_metrics(log, cfg);
-    const gate = gate_stats(log.route);
+    const gate = gate_stats(log.t, log.route);
 
     const maxPts = 700;
     const factor = Math.max(1, Math.floor(log.t.length / maxPts));
 
     const chartData = [];
     for (let i = 0; i < log.t.length; i += factor) {
-      const route01 = (log.route[i] === "PRODUCT") ? 1 : 0;
+      const routeStr = log.route[i]; // "PRODUCT" | "RECYCLE"
+      const route01_product = (routeStr === "PRODUCT") ? 1 : 0;
 
       chartData.push({
         t: Math.round(log.t[i]),
@@ -1047,7 +1105,9 @@ self.onmessage = (e) => {
         dTsub: log.dTsub[i],
         Gate_dTsub_min: cfg.GATE.dTsub_min,
 
-        route: route01,
+        // routing
+        routeStr,
+        route01_product, // 1=PRODUCT, 0=RECYCLE
         analyzer_ok: log.analyzer_ok[i],
 
         // flows & level
