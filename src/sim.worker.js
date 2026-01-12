@@ -1,15 +1,29 @@
-// src/sim.worker.js (P&ID v2.1.1+: deviation-FOPDT + multi PI + quality gate + interlocks + MODE UJI)
+// src/sim.worker.js (P&ID v2.1.2: deviation-FOPDT + multi PI + quality gate + interlocks + MODE UJI)
 // - FIX: IL-03 reachable with current condenser model (T_cond_out max ~46.25 C) => set HH=46.0
 // - FIX: clamp tuning inputs (Kp>=0, Ti>0) to avoid "bug palsu" dari salah input UI
 // - FIX: ignore unknown sp_steps keys (avoid NaN propagation)
-// - IMPROVE: route telemetry (send routeStr + route01_product)
-// - IMPROVE: gate_stats now returns timing (tFirstProduct, tLastProduct, productTime_s)
+// - FIX: restore backward-compatible chart keys (Route01, GateMin) so old charts show again
+// - IMPROVE: route telemetry (routeStr + route01_product + RouteScaled)
+// - IMPROVE: gate_stats adds timing (tFirstProduct, tLastProduct, productTime_s)
 // - IMPROVE: settling_time handles "startup transient" even if SP is constant
 // - IMPROVE: overshoot uses step-direction (better for up/down steps)
+// - IMPROVE: export gate debug signals (on_ok/off_bad timers) to validate gate behavior in plots/tables
+// - IMPROVE: provide *_Str fields for metrics so 0 does NOT get rendered as "-" by buggy UI truthy checks
 
+// ============================================================
+// 0) SMALL UTILS
+// ============================================================
 const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, Number(x)));
 const clamp01 = (x) => clamp(x, 0.0, 1.0);
 const step = (t, t0, amp) => (t >= t0 ? Number(amp) : 0.0);
+
+const isFiniteNum = (x) => Number.isFinite(Number(x));
+
+const fmt = (x, digits = 2) => {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return "-";
+  return n.toFixed(digits);
+};
 
 // ===== INPUT SANITIZER (anti NaN / empty string / boolean string) =====
 const numOr = (x, fallback) => {
@@ -174,12 +188,16 @@ class QualityGate {
     this.route = "RECYCLE";
     this.on_timer = 0.0;
     this.off_timer = 0.0;
+    this.last_on_ok = false;
+    this.last_off_bad = false;
   }
 
   reset() {
     this.route = "RECYCLE";
     this.on_timer = 0.0;
     this.off_timer = 0.0;
+    this.last_on_ok = false;
+    this.last_off_bad = false;
   }
 
   update(dt, TT106, rho15, dTsub, analyzer_ok = true, permissive_ok = true) {
@@ -190,6 +208,8 @@ class QualityGate {
       this.route = "RECYCLE";
       this.on_timer = 0.0;
       this.off_timer = 0.0;
+      this.last_on_ok = false;
+      this.last_off_bad = true;
       return this.route;
     }
 
@@ -202,6 +222,9 @@ class QualityGate {
       (TT106 < c.TT106_off_low || TT106 > c.TT106_off_high) ||
       (rho15 < c.rho15_off_low || rho15 > c.rho15_off_high) ||
       (dTsub < c.dTsub_min_off);
+
+    this.last_on_ok = !!on_ok;
+    this.last_off_bad = !!off_bad;
 
     if (this.route === "RECYCLE") {
       this.on_timer = on_ok ? (this.on_timer + dt) : 0.0;
@@ -430,8 +453,8 @@ const overshoot_percent = (sp, pv) => {
   if (!sp?.length || !pv?.length) return null;
   const sp0 = Number(sp[0]);
   const spFinal = Number(sp[sp.length - 1]);
-  const step = spFinal - sp0;
-  const stepAbs = Math.abs(step);
+  const dSP = spFinal - sp0;
+  const stepAbs = Math.abs(dSP);
   if (!Number.isFinite(stepAbs) || stepAbs < 1e-9) return null;
 
   let maxPV = -Infinity;
@@ -442,7 +465,7 @@ const overshoot_percent = (sp, pv) => {
     minPV = Math.min(minPV, v);
   }
 
-  if (step > 0) {
+  if (dSP > 0) {
     return Math.max(0.0, ((maxPV - spFinal) / stepAbs) * 100.0);
   } else {
     return Math.max(0.0, ((spFinal - minPV) / stepAbs) * 100.0);
@@ -461,21 +484,18 @@ const settling_time = (t, sp, pv, band = 0.02, hold_s = 60.0) => {
   const dt = t.length > 1 ? (Number(t[1]) - Number(t[0])) : 1.0;
   const hold_n = Math.max(1, Math.round(Number(hold_s) / Math.max(dt, 1e-9)));
 
-  // toleransi settling terhadap nilai final
   const tol = Math.max(Math.abs(spFinal) * Number(band), 1e-6);
 
   const spStepAbs = Math.abs(spFinal - sp0);
   const spStepEps = Math.max(1e-6, 0.001 * Math.max(1.0, Math.abs(sp0)));
 
   const pv0 = Number(pv[0]);
-
   const hasMeaningfulStep = Number.isFinite(spStepAbs) && spStepAbs > spStepEps;
 
   // Kalau tidak ada step, tapi PV awal sudah di dalam band -> N/A
   if (!hasMeaningfulStep && Math.abs(pv0 - spFinal) <= tol) return null;
 
   // Wajib: PV harus pernah "di luar band" final dulu.
-  // - Untuk startup transient: ini otomatis true (PV0 di luar band)
   let firstOutside = -1;
   for (let i = 0; i < pv.length; i++) {
     const v = Number(pv[i]);
@@ -527,10 +547,12 @@ const gate_stats = (t, routeArr) => {
 
   return {
     productPct: frac * 100.0,
+    productPct_Str: fmt(frac * 100.0, 2),
     switches,
     tFirstProduct,
     tLastProduct,
-    productTime_s
+    productTime_s,
+    productTime_s_Str: fmt(productTime_s, 0),
   };
 };
 
@@ -594,7 +616,11 @@ const simulate = (cfg) => {
     F_reflux: [], L_v201: [], rho15: [], analyzer_ok: [],
     SP_F_feed: [], SP_T_feed_out: [], SP_T_reb: [], SP_T_cond_out: [], SP_F_reflux: [], SP_L_v201: [],
     u_feed: [], u_steam_pre: [], u_steam_reb: [], u_cw: [], u_reflux: [], u_draw: [],
-    dTsub: [], route: []
+    dTsub: [], route: [],
+
+    // gate debug (validasi presentasi)
+    gate_on_ok: [], gate_off_bad: [], gate_on_timer: [], gate_off_timer: [],
+    gate_perm_ok: [], gate_analyzer_ok: [],
   };
 
   let route_prev = "RECYCLE";
@@ -678,6 +704,7 @@ const simulate = (cfg) => {
 
     const eps = 1e-6;
 
+    // If MV overridden by interlock => controller tracks (prevents windup jump)
     if (Math.abs(mv.u_feed - mv_before_il.u_feed) > eps) {
       C.FIC101.track(mv.u_feed, sp.F_feed, pv.F_feed);
     }
@@ -712,6 +739,7 @@ const simulate = (cfg) => {
 
     active_prev = active_now;
 
+    // LOG
     log.t.push(ti);
 
     log.F_feed.push(pv.F_feed);
@@ -741,6 +769,14 @@ const simulate = (cfg) => {
 
     log.dTsub.push(dTsub);
     log.route.push(route);
+
+    // gate debug signals
+    log.gate_on_ok.push(gate.last_on_ok ? 1 : 0);
+    log.gate_off_bad.push(gate.last_off_bad ? 1 : 0);
+    log.gate_on_timer.push(gate.on_timer);
+    log.gate_off_timer.push(gate.off_timer);
+    log.gate_perm_ok.push(permissive_ok ? 1 : 0);
+    log.gate_analyzer_ok.push(pv.analyzer_ok ? 1 : 0);
   }
 
   return { log, event_log };
@@ -752,17 +788,30 @@ const simulate = (cfg) => {
 const summarize_metrics = (log, cfg) => {
   const t = log.t;
   const use_norm = cfg.METRIC.normalize_error;
-  const spans = cfg.METRIC.span;
+  const spans = cfg.METRIC.span || {};
 
   const one = (loopName, spKey, pvKey) => {
     const sp = log[spKey];
     const pv = log[pvKey];
 
-    const { iae, itae } = calc_iae_itae(t, sp, pv, use_norm, spans[loopName]);
+    const span = isFiniteNum(spans[loopName]) ? Number(spans[loopName]) : 1.0;
+
+    const { iae, itae } = calc_iae_itae(t, sp, pv, use_norm, span);
     const os = overshoot_percent(sp, pv);
     const st = settling_time(t, sp, pv, cfg.METRIC.settle_band, cfg.METRIC.settle_hold_s);
 
-    return { IAE: iae, ITAE: itae, OvershootPct: os, SettlingTime: st };
+    return {
+      IAE: iae,
+      ITAE: itae,
+      OvershootPct: os,
+      SettlingTime: st,
+
+      // string fields (safe for UI that wrongly treats 0 as falsy)
+      IAE_Str: fmt(iae, 2),
+      ITAE_Str: fmt(itae, 2),
+      OvershootPct_Str: (os === null || os === undefined) ? "N/A" : fmt(os, 2),
+      SettlingTime_Str: (st === null || st === undefined) ? "N/A" : fmt(st, 0),
+    };
   };
 
   const mapping = [
@@ -867,6 +916,7 @@ const run_test_suite = (base_cfg) => {
       name,
       gate: g,
       totalIAE,
+      totalIAE_Str: fmt(totalIAE, 2),
       metrics
     });
   }
@@ -1069,11 +1119,26 @@ self.onmessage = (e) => {
       return;
     }
 
-    // single = baseline run (disturbances OFF). analyzerFail can still be enabled from UI.
-    cfg.TEST.sp_steps = [];
+    // ======================================================
+    // SINGLE RUN OPTIONS (default baseline)
+    // You can enable an optional single-step test from UI:
+    // payload.singleStepEnable=true, singleStepKey="T_cond_out", singleStepDelta=+2, singleStepTime=600
+    // ======================================================
+    const singleStepEnable = boolOr(payload.singleStepEnable, false);
+
+    // baseline run (disturbances OFF). analyzerFail can still be enabled from UI.
     cfg.TEST.d_feed_temp = 0.0;
     cfg.TEST.d_vapor = 0.0;
     cfg.TEST.cw_degrade_drop = 0.0;
+
+    if (!singleStepEnable) {
+      cfg.TEST.sp_steps = [];
+    } else {
+      const key = String(payload.singleStepKey || "T_cond_out");
+      const delta = numOr(payload.singleStepDelta, 2.0);
+      const tStep = numOr(payload.singleStepTime, 600.0);
+      cfg.TEST.sp_steps = [{ t: tStep, key, delta }];
+    }
 
     const { log, event_log } = simulate(cfg);
     const metrics = summarize_metrics(log, cfg);
@@ -1085,7 +1150,13 @@ self.onmessage = (e) => {
     const chartData = [];
     for (let i = 0; i < log.t.length; i += factor) {
       const routeStr = log.route[i]; // "PRODUCT" | "RECYCLE"
-      const route01_product = (routeStr === "PRODUCT") ? 1 : 0;
+      const route01 = (routeStr === "PRODUCT") ? 1 : 0;
+
+      const dTsub = log.dTsub[i];
+      const gateMin = cfg.GATE.dTsub_min;
+
+      // Helpful derived view: ATsub crosses 0 when dTsub crosses gateMin
+      const ATsub = dTsub - gateMin;
 
       chartData.push({
         t: Math.round(log.t[i]),
@@ -1102,13 +1173,23 @@ self.onmessage = (e) => {
         Gate_rho_low: cfg.GATE.rho15_on_low,
         Gate_rho_high: cfg.GATE.rho15_on_high,
 
-        dTsub: log.dTsub[i],
-        Gate_dTsub_min: cfg.GATE.dTsub_min,
+        dTsub,
+        Gate_dTsub_min: gateMin,
+        Gate_dTsub_min_off: cfg.GATE.dTsub_min_off,
 
-        // routing
+        // backward-compatible names (IMPORTANT: fixes missing plot lines on old UI)
+        GateMin: gateMin,     // old UI "Gate Min"
+        Route01: route01,     // old UI "Route (0/1)"
+
+        // routing (new)
         routeStr,
-        route01_product, // 1=PRODUCT, 0=RECYCLE
+        route01_product: route01,
+        RouteScaled: route01 * 10, // optional: helps visibility on same axis
         analyzer_ok: log.analyzer_ok[i],
+
+        // derived for "threshold crossing" plot
+        ATsub,          // dTsub - GateMin
+        ATsub_Zero: 0,  // threshold line at 0
 
         // flows & level
         Ffeed: log.F_feed[i],
@@ -1125,12 +1206,30 @@ self.onmessage = (e) => {
         u_cw: log.u_cw[i],
         u_reflux: log.u_reflux[i],
         u_draw: log.u_draw[i],
+
+        // gate debug (presentasi: bukti gate bekerja dari syarat kualitas)
+        gate_on_ok: log.gate_on_ok[i],
+        gate_off_bad: log.gate_off_bad[i],
+        gate_on_timer: log.gate_on_timer[i],
+        gate_off_timer: log.gate_off_timer[i],
+        gate_perm_ok: log.gate_perm_ok[i],
+        gate_analyzer_ok: log.gate_analyzer_ok[i],
       });
     }
 
     const eventLog = (event_log || []).slice(0, 200).map(([t, msg]) => ({ t, msg }));
 
-    self.postMessage({ mode: "single", chartData, metrics, gate, eventLog });
+    // Add small meta definitions (safe: UI can ignore)
+    const meta = {
+      productPct_definition:
+        "ProductPct = persentase waktu simulasi ketika route=PRODUCT (bukan mass yield). productTime_s = total waktu route=PRODUCT (detik).",
+      gate_definition:
+        "Gate=PRODUCT bila (TT106 in-range) AND (rho15 in-range) AND (dTsub>=min) kontinu selama delay_on_s, serta analyzer_ok & permissive_ok. Jika off_bad kontinu delay_off_s atau interlock/analyzer fail => RECYCLE.",
+      note_overshoot:
+        "Overshoot/Settling pada baseline tanpa step bisa N/A. Gunakan MODE UJI (suite) atau singleStepEnable untuk melihat respons step.",
+    };
+
+    self.postMessage({ mode: "single", chartData, metrics, gate, eventLog, meta });
   } catch (err) {
     self.postMessage({ error: String(err?.message || err) });
   }
