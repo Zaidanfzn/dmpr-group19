@@ -425,23 +425,47 @@ const overshoot_percent = (sp, pv) => {
   return Math.max(0.0, ((peak - spFinal) / Math.abs(spFinal)) * 100.0);
 };
 
+// ====== REPLACE THIS FUNCTION ONLY ======
 const settling_time = (t, sp, pv, band = 0.02, hold_s = 60.0) => {
+  if (!t?.length || !sp?.length || !pv?.length) return null;
+
+  const sp0 = Number(sp[0]);
   const spFinal = Number(sp[sp.length - 1]);
+
+  // 1) Kalau baseline / tidak ada perubahan SP yang bermakna -> N/A (bukan 0)
+  const spStepAbs = Math.abs(spFinal - sp0);
+  const spStepEps = Math.max(1e-6, 0.001 * Math.max(1.0, Math.abs(sp0))); // 0.1% dari SP awal (min 1e-6)
+  if (!Number.isFinite(spStepAbs) || spStepAbs <= spStepEps) return null;
+
+  // 2) Toleransi settling terhadap nilai final
   const tol = Math.max(Math.abs(spFinal) * Number(band), 1e-6);
 
-  const dt = t.length > 1 ? (t[1] - t[0]) : 1.0;
+  const dt = t.length > 1 ? (Number(t[1]) - Number(t[0])) : 1.0;
   const hold_n = Math.max(1, Math.round(Number(hold_s) / Math.max(dt, 1e-9)));
 
-  const inside = pv.map((v) => Math.abs(Number(v) - spFinal) <= tol);
-
-  for (let i = 0; i < t.length; i++) {
-    const j = i + hold_n;
-    if (j <= t.length) {
-      let ok = true;
-      for (let k = i; k < j; k++) { if (!inside[k]) { ok = false; break; } }
-      if (ok) return Number(t[i]);
-    }
+  // 3) Wajib: PV harus pernah keluar band final dulu.
+  //    Kalau tidak pernah keluar band -> N/A (bukan 0)
+  let firstOutside = -1;
+  for (let i = 0; i < pv.length; i++) {
+    const v = Number(pv[i]);
+    if (Math.abs(v - spFinal) > tol) { firstOutside = i; break; }
   }
+  if (firstOutside < 0) return null;
+
+  // 4) Cari waktu pertama ketika PV masuk band dan bertahan hold_s detik
+  for (let i = firstOutside; i < t.length; i++) {
+    const j = i + hold_n;
+    if (j > t.length) break;
+
+    let ok = true;
+    for (let k = i; k < j; k++) {
+      const v = Number(pv[k]);
+      if (Math.abs(v - spFinal) > tol) { ok = false; break; }
+    }
+    if (ok) return Number(t[i]);
+  }
+
+  // Tidak pernah settle sampai akhir simulasi
   return null;
 };
 
